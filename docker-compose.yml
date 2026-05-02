@@ -1,0 +1,52 @@
+services:
+  postgresdb:
+    image: postgres:16-alpine
+    container_name: postgresdb
+    environment:
+      POSTGRES_DB: warehouse
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: Sec%e6P@sswor4
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse -d warehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin_ui
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: adminpassword
+    ports:
+      - "8082:80"
+    depends_on:
+      - postgresdb
+
+  inventoryapp:
+    #build: .
+    image: inventory-app:0.1
+    container_name: inventoryapp
+    depends_on:
+      postgresdb:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresdb:5432/warehouse
+      SPRING_DATASOURCE_USERNAME: warehouse
+      SPRING_DATASOURCE_PASSWORD: Sec%e6P@sswor4
+      APP_SECURITY_API_KEYS: dev-api-key-001,dev-api-key-002
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.27.xsd">
+
+    <!--
+        One changeset per logical change.
+        SQL changesets only — never modify an existing changeset; always add a new one.
+    -->
+    <include file="db/changelog/changes/001-create-products.sql"   relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/002-create-inventory.sql"  relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/003-create-reservations.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/004-create-reservation-items.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/005-create-reservation-events.sql" relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/006-add-indexes.sql"       relativeToChangelogFile="false"/>
+    <include file="db/changelog/changes/007-seed-data.sql"         relativeToChangelogFile="false"/>
+</databaseChangeLog>

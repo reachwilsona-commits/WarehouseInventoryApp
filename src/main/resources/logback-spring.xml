@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- JSON appender for production / containers -->
+    <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeContext>false</includeContext>
+            <includeMdc>true</includeMdc>
+            <fieldNames>
+                <timestamp>timestamp</timestamp>
+                <message>message</message>
+                <logger>logger</logger>
+                <thread>thread</thread>
+                <levelValue>[ignore]</levelValue>
+            </fieldNames>
+            <customFields>{"service":"warehouse-inventory"}</customFields>
+        </encoder>
+    </appender>
+
+    <!-- Plain text appender for local dev (set SPRING_PROFILES_ACTIVE=local) -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <springProfile name="local">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="!local">
+        <root level="INFO">
+            <appender-ref ref="JSON"/>
+        </root>
+    </springProfile>
+
+    <!-- Dedicated audit + domain-event loggers stay on the same appender so they
+         appear in the same stream with structured fields. -->
+    <logger name="audit-trail"   level="INFO" additivity="false">
+        <appender-ref ref="JSON"/>
+    </logger>
+    <logger name="domain-events" level="INFO" additivity="false">
+        <appender-ref ref="JSON"/>
+    </logger>
+
+</configuration>
