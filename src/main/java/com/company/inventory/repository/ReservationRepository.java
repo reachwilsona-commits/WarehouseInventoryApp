@@ -48,4 +48,5 @@ public interface ReservationRepository extends JpaRepository<Reservation, UUID> 
         """, nativeQuery = true)
     List<Reservation> findExpired(@Param("now") OffsetDateTime now, @Param("limit") int limit);
 
+
 }

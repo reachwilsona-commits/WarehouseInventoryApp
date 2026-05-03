@@ -28,25 +28,40 @@ services:
     depends_on:
       - postgresdb
 
-  inventoryapp:
-    #build: .
-    image: inventory-app:0.1
-    container_name: inventoryapp
-    depends_on:
-      postgresdb:
-        condition: service_healthy
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresdb:5432/warehouse
-      SPRING_DATASOURCE_USERNAME: warehouse
-      SPRING_DATASOURCE_PASSWORD: Sec%e6P@sswor4
-      APP_SECURITY_API_KEYS: dev-api-key-001,dev-api-key-002
+#  inventoryapp:
+#    image: inventory-app:0.2
+#    container_name: inventoryapp
+#    depends_on:
+#      postgresdb:
+#        condition: service_healthy
+#    environment:
+#      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresdb:5432/warehouse
+#      SPRING_DATASOURCE_USERNAME: warehouse
+#      SPRING_DATASOURCE_PASSWORD: Sec%e6P@sswor4
+#      APP_SECURITY_API_KEYS: dev-api-key-001,dev-api-key-002
+#    ports:
+#      - "8080:8080"
+#    healthcheck:
+#      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+#      interval: 10s
+#      timeout: 3s
+#      retries: 10
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: nats
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
-      - "8080:8080"
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - natsdata:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
-      interval: 10s
-      timeout: 3s
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
       retries: 10
 
 volumes:
   pgdata:
+  natsdata:

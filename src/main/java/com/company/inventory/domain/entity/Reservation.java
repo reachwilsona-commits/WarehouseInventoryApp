@@ -52,7 +52,7 @@ public class Reservation {
     private long version;
 
     @OneToMany(mappedBy = "reservation", cascade = CascadeType.ALL, orphanRemoval = true,
-               fetch = FetchType.LAZY)
+               fetch = FetchType.EAGER)
     private List<ReservationItem> items = new ArrayList<>();
 
     protected Reservation() {}

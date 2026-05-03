@@ -178,7 +178,7 @@ public class ReservationService {
         //3. Publish the event
         publishEvent(EventType.RESERVATION_CONFIRMED, reservation, null);
         //4. Log the event
-        logTransition(reservation, reservation.getStatus(), reservation.getStatus());
+        logTransition(reservation, ReservationStatus.PENDING, reservation.getStatus());
         return reservation;
     }
 

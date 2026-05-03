@@ -34,17 +34,6 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/**
- * Pure unit tests — no Spring context. Mocks the repositories and asserts business behaviour.
- *
- * <p>Spec coverage:
- *  - Insufficient stock: reservation rejected when any SKU lacks stock
- *  - Partial stock: SKU A available, SKU B not — entire reservation rejected, A not decremented
- *  - Idempotency: duplicate orderId returns existing reservation, no new record
- *  - Confirm: PENDING → CONFIRMED publishes event, audit-logs transition
- *  - Cancel: PENDING → CANCELLED releases stock, publishes event
- *  - Confirm/cancel of unknown id throws ReservationNotFoundException
- */
 class ReservationServiceTest {
 
     private ReservationRepository reservationRepository;

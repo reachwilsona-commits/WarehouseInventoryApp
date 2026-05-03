@@ -14,10 +14,6 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/**
- * Spec coverage: Factory must produce reservations with the correct initial state, expiry,
- * and items. Tests serve as design-pattern coverage for the Factory pattern.
- */
 class ReservationFactoryTest {
 
     private final ReservationProperties props = new ReservationProperties(10, "0 */2 * * * *", 100);

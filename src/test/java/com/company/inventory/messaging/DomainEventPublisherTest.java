@@ -13,11 +13,6 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Spec coverage: Observer pattern. Adding a new subscriber requires zero changes
- * to producers — proven by constructing a publisher with two subscribers and
- * confirming both receive the event without the producer knowing about either.
- */
 class DomainEventPublisherTest {
 
     @Test

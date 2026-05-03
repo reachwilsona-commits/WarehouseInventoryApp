@@ -31,7 +31,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.UUID;
 
 /**
- * Controller class for Reservation
+ * Controller class for Reservation REST endpoints
  */
 @RestController
 @RequestMapping("/api/v1/reservations")
@@ -57,8 +57,7 @@ public class ReservationController {
         try {
             result = service.createReservation(toCommand(request));
         } catch (IdempotentRetryException race) {
-            // Lost the unique-constraint race against a concurrent insert with the same orderId.
-            // Re-fetch in a fresh transaction and report it as a duplicate.
+            //A concurrent request inserted the same orderId first, so fetch it again and treat it as a duplicate.
             Reservation existing = service.fetchExistingByOrderId(race.orderId());
             return duplicate(existing);
         }
@@ -70,14 +69,17 @@ public class ReservationController {
                 .body(ApiResponse.success(ReservationResponse.from(result.reservation())));
     }
 
-    private ResponseEntity<ApiResponse<ReservationResponse>> duplicate(Reservation existing) {
-        // Spec: HTTP 200 + DUPLICATE_ORDER. Body still uses the success envelope so the
-        // client can read the existing reservation. We also surface the DUPLICATE_ORDER
-        // header so observability tooling can count duplicates without parsing bodies.
+    /**
+     * Return HTTP 200 with a DUPLICATE_ORDER flag, so the client gets the existing reservation,
+     * and include a header to track duplicates without reading the response body.
+     * @param existingReservation Reservation
+     * @return ReservationResponse
+     */
+    private ResponseEntity<ApiResponse<ReservationResponse>> duplicate(Reservation existingReservation) {
         return ResponseEntity.status(HttpStatus.OK)
                 .header("X-Idempotent-Replay", "true")
                 .header("X-Error-Code", ErrorCode.DUPLICATE_ORDER.name())
-                .body(ApiResponse.success(ReservationResponse.from(existing)));
+                .body(ApiResponse.success(ReservationResponse.from(existingReservation)));
     }
 
     /**

@@ -58,4 +58,5 @@ public class ReservationEvents {
     public String getPayload() { return payload; }
     public OffsetDateTime getCreatedAt() { return createdAt; }
     public OffsetDateTime getPublishedAt() { return publishedAt; }
+
 }

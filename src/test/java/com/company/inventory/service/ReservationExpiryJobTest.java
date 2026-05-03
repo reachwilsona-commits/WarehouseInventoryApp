@@ -30,12 +30,6 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-/**
- * Spec coverage:
- *  - Expiry job — expired: a reservation past TTL is cancelled and stock returned
- *  - Expiry job — recent: a recently created reservation is not touched
- *  - Cancellation event carries reason TTL_EXPIRED
- */
 class ReservationExpiryJobTest {
 
     private ReservationRepository reservationRepository;

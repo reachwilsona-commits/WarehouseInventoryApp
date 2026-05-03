@@ -11,12 +11,6 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/**
- * Spec coverage:
- *  - Valid transitions: PENDING→CONFIRMED, PENDING→CANCELLED
- *  - Invalid transitions: CONFIRMED→CANCELLED, CANCELLED→CONFIRMED, CANCELLED→CANCELLED, CONFIRMED→CONFIRMED
- *  - Design pattern coverage: state mutations go through the State classes, not service if/else
- */
 class ReservationStateTransitionTest {
 
     private Reservation newPending() {
