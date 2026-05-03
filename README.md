@@ -1,283 +1,286 @@
 # Warehouse Inventory Reservation Service
 
-A backend service that manages real-time inventory reservations under concurrent load. Implements the **Core track** of the Fortna WES Engineering Principal Engineer take-home: Java 21, Spring Boot 3, PostgreSQL, Liquibase, OpenAPI, Docker Compose, unit tests, and Testcontainers integration tests.
+A backend service that manages real-time inventory reservations under concurrent load.
+This service is using Java 21, Spring Boot 3.3, PostgresSQL, NATS JetStream, Redis, Liquibase, and TestContainers.
 
 ---
 
 ## 1. Challenge choice and rationale
 
-I built only the Core track. Two days of solo engineering buys depth in one place or breadth across many; I chose depth on the things the assignment graded explicitly — concurrency correctness, idempotency, the State / Factory / Observer patterns, and a Testcontainers-backed test suite that proves both. Spending the same hours wiring NATS JetStream and Redis on top would have meant shallower invariants on the bits that matter most. The event boundary is designed so that adding a NATS adapter later is one new `EventSubscriber` class — zero changes to the reservation service — which is the spirit of the optional tracks.
+I implemented the **Core track plus both optional tracks — Advanced Track A (NATS JetStream) and Advanced Track B (Redis cache + distributed lock)**. The Core track is the foundation: concurrency correctness, idempotency, state machine, and a TestContainers test suite that proves the invariants against a real database. Once the Core was solid, adding NATS and Redis was straightforward because the event boundary and service layer were already designed for extension a new `EventSubscriber` for the outbox relay, a new `InventoryCacheService` for cache-aside reads, zero changes to `ReservationService`. The distributed lock on the expiry job follows naturally from having Redis already wired. Choosing depth on the Core first, then adding the tracks, kept each layer independently testable and verifiable.
+
+---
 
 ## 2. Architecture overview
 
 ```
 src/main/java/com/company/inventory
-├── config/               @ConfigurationProperties + Clock/ObjectMapper/OpenAPI beans
-├── controller/           REST endpoints (Reservation, Inventory, Health)
+├── cache/               InventoryCacheService (read-through), DistributedLockService interface,
+│                        RedisDistributedLockService, NoOpDistributedLockService
+├── config/              @ConfigurationProperties records: ReservationProperties, NatsProperties,
+│                        RedisProperties, SecurityProperties; Clock / ObjectMapper / OpenAPI beans;
+│                        NatsConfig (stream + consumer setup), RedisConfig
+├── controller/          REST endpoints — Reservation, Inventory, Health
 ├── domain/
-│   ├── entity/           JPA aggregates: Product, Inventory, Reservation, ReservationItem, ReservationEvents, ReservationStatus
-│   ├── event/            DomainEvent hierarchy (Created/Confirmed/Cancelled) + EventType + CancellationReason
-│   ├── factory/          ReservationFactory — Factory pattern entry point
-│   └── state/            ReservationState + Pending/Confirmed/Cancelled — State pattern + ReservationStateFactory
-├── exception/            BusinessException hierarchy + ErrorCode → HTTP-status enum + GlobalExceptionHandler
-├── log/                  StateTransitionLogger — structured audit trail per spec
+│   ├── entity/          JPA aggregates: Product, Inventory, Reservation, ReservationItem,
+│   │                    ReservationEvents, ReservationStatus
+│   ├── event/           DomainEvent hierarchy (Created / Confirmed / Cancelled),
+│   │                    EventType, CancellationReason, NatsSubject, NatsEventEnvelope
+│   ├── factory/         ReservationFactory — Factory pattern
+│   └── state/           ReservationState + Pending / Confirmed / Cancelled + ReservationStateFactory
+├── exception/           BusinessException hierarchy + ErrorCode enum + GlobalExceptionHandler
+├── log/                 StateTransitionLogger — structured JSON audit trail
 ├── messaging/
-│   ├── publisher/        EventPublisher interface (Observer producer) + DomainEventPublisher
-│   └── subscribers/      EventSubscriber + OutboxPersistenceSubscriber + SubscriberLogging
-├── model/
-│   ├── error/            ApiError envelope
-│   ├── request/          CreateReservationRequest, RequestedItem
-│   └── response/         ApiResponse, HealthResponse, InventoryResponse, PageResponse, ReservationResponse
-├── repository/           Spring Data JPA; pessimistic locks live here, not in services
-├── security/             ApiKeyAuthFilter (servlet filter) + SecurityFilterConfig
-└── service/              ReservationService, InventoryService, ReservationExpiryJob, ReservationCommand, ReservationResult
+│   ├── nats/            NatsOutboxJob (outbox relay to NATS), NatsInventoryEventConsumer
+│   ├── publisher/       EventPublisher interface + DomainEventPublisher (Observer fan-out)
+│   └── subscribers/     EventSubscriber, OutboxPersistenceSubscriber, SubscriberLogging
+├── model/               Request / response / error records (DTOs only, no logic)
+├── repository/          Spring Data JPA; all lock annotations and native queries live here
+├── security/            ApiKeyAuthFilter + SecurityFilterConfig
+└── service/             ReservationService, InventoryService, ReservationExpiryJob,
+                         ReservationCommand, ReservationResult
 ```
 
-Layer responsibilities, in one line each:
+Each layer has one job. `controller/` speaks HTTP. `service/` owns transactions and orchestration. `domain/` holds business rules. `repository/` owns SQL strategy. `messaging/` is the event boundary — producers never know who is listening. `cache/` owns all Redis interactions so Redis failure never leaks into service logic. `log/` writes the structured audit trail on every state change.
 
-- **controller/** speaks HTTP and validates input; it never touches the database directly.
-- **service/** orchestrates a single transaction per request; owns concurrency control.
-- **domain/** is the only place where business rules live (state machine + invariants).
-- **repository/** owns SQL strategy (locks, skip-locked, query shape).
-- **messaging/** is the event boundary; producers don't know about subscribers.
-- **log/** writes the mandated structured log entry on every state change.
-
-The reservation service depends on the **producer** half of the event boundary (`EventPublisher`) and on no individual subscriber, so we can plug in NATS, Kafka, log-only, or a test capture by adding one bean.
+---
 
 ## 3. Framework choice
 
-**Spring Boot 3.3 on Java 21.** Reasons:
+**Spring Boot 3.3 on Java 21.**
 
-1. **Spring Data JPA** gives us `@Lock(PESSIMISTIC_WRITE)` on a single repository annotation — the locking strategy is declarative and reviewable in one place.
-2. **Spring's transaction management** lets the cancel/expiry paths share a single `@Transactional(propagation = MANDATORY)` helper, which guarantees the row-level lock and the state mutation always live in the same transaction.
-3. **springdoc-openapi** generates Swagger UI at `/swagger-ui.html` with no code beyond the `OpenApiConfig` bean.
-4. **`@Scheduled` + `@EnableScheduling`** is enough for the expiry job — combined with `FOR UPDATE SKIP LOCKED` we don't need an external scheduler or a distributed lock.
-5. **Spring Boot Testcontainers** makes integration tests one annotation away from a real Postgres.
+Spring Data JPA gives `@Lock(PESSIMISTIC_WRITE)` as a single repository annotation — the locking strategy is declarative and visible in one place. Spring's transaction management lets confirm and cancel share a `cancelInternal` helper that is always called inside an active transaction. `@Scheduled` handles the expiry cron job with no external scheduler. `@ConditionalOnProperty` wires NATS and Redis beans only when their respective feature flags are enabled, so the same artifact can run in environments without those services. Spring Boot Testcontainers makes integration tests one annotation away from real Postgres. Quarkus would have been fine; Spring's depth of JPA locking idioms and its first-class conditional bean model tipped the choice for a service that has multiple optional infrastructure dependencies.
 
-Quarkus would have been fine; Spring's depth of Postgres-locking idioms (the JPA `@QueryHints`, `@Lock`, native queries with `SKIP LOCKED`) tipped the choice.
+---
 
 ## 4. Design patterns
 
-All three are required. Each links to the exact source file.
-
-| Pattern | File | Why it fits |
+| Pattern | Location | Why it fits |
 |---|---|---|
-| **State** | [`ReservationState.java`](src/main/java/com/company/inventory/domain/state/ReservationState.java), [`PendingState.java`](src/main/java/com/company/inventory/domain/state/PendingState.java), [`ConfirmedState.java`](src/main/java/com/company/inventory/domain/state/ConfirmedState.java), [`CancelledState.java`](src/main/java/com/company/inventory/domain/state/CancelledState.java), [`ReservationStateFactory.java`](src/main/java/com/company/inventory/domain/state/ReservationStateFactory.java) | Each state knows which transitions it permits; the default `confirm()`/`cancel()` on the abstract class throws `InvalidStateTransitionException`, and concrete subclasses override only what's legal. The service layer never branches on `ReservationStatus`. Try the test `ReservationStateTransitionTest` — it walks every legal and illegal edge of the lifecycle. |
-| **Factory** | [`ReservationFactory.java`](src/main/java/com/company/inventory/domain/factory/ReservationFactory.java) | A reservation has three things that must be set consistently every time: a UUID, an initial state of PENDING, and an `expiresAt` derived from the configured TTL. Centralising construction prevents drift across the controller, the scheduled job, and tests. The factory also coalesces duplicate SKUs in the same request before they hit the unique-key constraint on `reservation_items`. |
-| **Observer** | [`EventPublisher.java`](src/main/java/com/company/inventory/messaging/publisher/EventPublisher.java), [`DomainEventPublisher.java`](src/main/java/com/company/inventory/messaging/publisher/DomainEventPublisher.java), [`EventSubscriber.java`](src/main/java/com/company/inventory/messaging/subscribers/EventSubscriber.java), [`OutboxPersistenceSubscriber.java`](src/main/java/com/company/inventory/messaging/subscribers/OutboxPersistenceSubscriber.java), [`SubscriberLogging.java`](src/main/java/com/company/inventory/messaging/subscribers/SubscriberLogging.java) | Subscribers are auto-discovered via Spring's `List<EventSubscriber>` injection. Adding a NATS-publishing subscriber is one new class implementing `EventSubscriber` — zero changes to `ReservationService` or its tests. The unit test `DomainEventPublisherTest` exercises the contract directly. |
+| **State** | `domain/state/ReservationState.java` and `Pending/Confirmed/CancelledState.java` | Each state knows which transitions it permits. The abstract base throws `InvalidStateTransitionException` by default; subclasses override only what is legal. Service code never branches on `ReservationStatus`. |
+| **Factory** | `domain/factory/ReservationFactory.java` | A reservation must always have a UUID, start in PENDING, and carry an `expiresAt` computed from the configured TTL. Centralising construction prevents that logic from drifting across the controller, expiry job, and tests. |
+| **Observer** | `messaging/publisher/EventPublisher.java`, `DomainEventPublisher.java`, and all `EventSubscriber` implementations | Subscribers are auto-discovered via Spring's `List<EventSubscriber>` injection. Adding the NATS outbox relay, the outbox persistence subscriber, and the structured-log subscriber each required a new class implementing one method — zero changes to `ReservationService`. |
 
-## 5. SOLID principles in this codebase
+---
 
-- **Single Responsibility** — `StateTransitionLogger` does one thing: writes the audit row. `ReservationFactory` does one thing: builds aggregates. The persistence and the structured-log subscriber are separate classes even though both react to the same events, because they have separate reasons to change.
-- **Open/Closed** — `ReservationState` is open for extension (add a new subclass) and closed for modification (existing subclasses don't change when a new state appears). Same shape for `EventSubscriber`: adding NATS doesn't require touching any existing class.
-- **Dependency Inversion** — `ReservationService` depends on the `EventPublisher` interface, not on `DomainEventPublisher` or any subscriber. The `Clock` is injected so tests can pin time without monkey-patching `OffsetDateTime.now()`.
-- **Interface Segregation** — `EventSubscriber` exposes a single `onEvent(DomainEvent)` method; subscribers don't have to implement methods they don't care about.
-- **Liskov** — every subclass of `ReservationState` honours the contract: it either performs the transition or throws `InvalidStateTransitionException`. No subclass weakens the contract by, say, silently no-op'ing.
+## 5. SOLID principles
+
+- **Single Responsibility** — `StateTransitionLogger` does one thing: write the structured audit row. `InventoryCacheService` does one thing: wrap Redis with fallback. Each subscriber (`OutboxPersistenceSubscriber`, `SubscriberLogging`, `NatsOutboxJob`) has its own reason to change.
+- **Open/Closed** — `ReservationState` is open for new states (add a subclass) without modifying existing ones. `EventSubscriber` is open for new delivery channels (NATS, Kafka, webhook) without touching the reservation service.
+- **Dependency Inversion** — `ReservationService` depends on `EventPublisher` (interface) and `InventoryCacheService` (concrete but injected). `ReservationExpiryJob` depends on `DistributedLockService` (interface) — it receives `NoOpDistributedLockService` when Redis is off, `RedisDistributedLockService` when Redis is on, without any conditional inside the job itself.
+- **Interface Segregation** — `EventSubscriber` exposes a single `onEvent(DomainEvent)` method. `DistributedLockService` exposes `tryAcquire` and `release` only.
+- **Liskov** — every `ReservationState` subclass either performs the transition or throws `InvalidStateTransitionException`. `NoOpDistributedLockService` is a valid substitute for `DistributedLockService` — callers never know the difference.
+
+---
 
 ## 6. Database design decisions
 
-| Table | Notable columns | Why |
+| Table | Notable columns | Reasoning |
 |---|---|---|
-| `products` | `sku VARCHAR(64) PK` | SKU is the natural key referenced by every other table. Bounded length keeps indexes compact. |
-| `inventory` | `total_stock`, `available_stock`, `reserved_stock`, `version`, plus a `CHECK` constraint that `available + reserved = total` | The CHECK is a paranoid invariant — it catches application bugs at the DB layer. `version` enables JPA optimistic locking in the rare paths that don't take a pessimistic lock. |
-| `reservations` | `id UUID PK`, `order_id VARCHAR(128) UNIQUE`, `status` with CHECK, `expires_at` | The UNIQUE on `order_id` is the **atomic** guard for idempotent POST: two simultaneous inserts with the same orderId cannot both succeed; the loser is translated into "return existing reservation". |
-| `reservation_items` | `UNIQUE (reservation_id, sku)`, `quantity > 0` CHECK | Prevents the same SKU being listed twice on the same reservation. The factory coalesces duplicates before insert, but the constraint is the safety net. |
-| `reservation_events` | `payload JSONB`, `published_at TIMESTAMPTZ NULL` | Outbox pattern. Written transactionally with the state change, so we cannot lose an event. `published_at NULL` lets a future drainer (NATS, Kafka) safely retry unpublished rows. |
+| `inventory` | `available_stock`, `reserved_stock`, `total_stock`, `version` | Three-column stock model makes oversell detection a simple `available_stock >= requested` check. `version` supports optimistic locking on read-only paths. A `CHECK (available_stock + reserved_stock = total_stock)` constraint catches application bugs at the DB layer. |
+| `reservations` | `order_id VARCHAR(128) UNIQUE`, `status`, `expires_at` | `UNIQUE` on `order_id` is the atomic idempotency guard. Two concurrent inserts for the same order cannot both succeed. |
+| `reservation_items` | `UNIQUE (reservation_id, sku)`, `quantity > 0` CHECK | Prevents duplicate SKUs on one reservation; factory coalesces before insert, constraint is the safety net. |
+| `reservation_events` | `payload JSONB`, `published_at TIMESTAMPTZ NULL` | Outbox pattern. Written in the same transaction as the state change; `published_at IS NULL` is the work queue for the NATS relay. |
 
-**Indexes** (in `006-add-indexes.sql`):
+**Indexes** (`006-add-indexes.sql`): partial index on `WHERE status = 'PENDING'` for the expiry query; partial index on `WHERE published_at IS NULL` for the outbox drainer; composite index on `(status, created_at)` for the list endpoint filter.
 
-- `idx_reservations_status_created` — supports the `?status=PENDING` filter on the list endpoint with `ORDER BY created_at DESC`.
-- `idx_reservations_pending_expires` — **partial** index on `WHERE status = 'PENDING'`, used by the expiry job. A partial index keeps the index tiny because confirmed/cancelled rows accumulate; the hot scan stays fast.
-- `idx_reservation_items_reservation` — FK lookup during cancel/expiry.
-- `idx_reservation_events_unpublished` — partial index on `WHERE published_at IS NULL` so an outbox drainer scans only the work queue, not the full event history.
+**Locking strategy** — discussed in §7.
 
-**Locking strategy** — covered in §7.
+**Trade-offs**: UUID v4 for reservation IDs (no monotonic insert hot spot, but slightly worse index locality than v7 — would switch to v7 when JDK support stabilises). `BIGSERIAL` on items and events tables (stable surrogate key, minor sequence overhead).
 
-**Trade-offs taken**: `BIGSERIAL` on `reservation_items` and `reservation_events` (sequence allocation overhead, but a stable surrogate key beats compound natural keys for the events table). UUID v4 chosen for reservation `id` (random, no monotonic-insert hot spot — but slightly worse index locality than v7. With more time I'd switch to v7 once the JDK / library support is broader).
+---
 
 ## 7. Concurrency strategy
 
-**Stock reservation** uses **pessimistic row-level locking** (`SELECT ... FOR UPDATE`). The reservation service:
+**Stock reservation — pessimistic locking.** `InventoryRepository.findBySkuInOrderBySkuAsc` acquires a `SELECT ... FOR UPDATE` write lock on every affected inventory row before checking availability. SKUs are sorted lexicographically so every transaction acquires locks in the same order, preventing deadlocks. The all-or-nothing pre-check runs against locked rows, deductions are applied, then the reservation is persisted — all in one transaction.
 
-1. Sorts the requested SKUs lexicographically, then
-2. Calls [`InventoryRepository.findBySkuInOrderBySkuAsc`](src/main/java/com/company/inventory/repository/InventoryRepository.java) which acquires a write lock on each row,
-3. Performs an **all-or-nothing pre-check** against the locked rows,
-4. Applies deductions, persists the reservation.
+Pessimistic was chosen over optimistic because contention is the expected case for a reservation system. Under a stampede, optimistic locking means most concurrent transactions would see a stale `version`, retry, and see it again — wasted work proportional to contention. Pessimistic locking serializes contended rows and lets uncontended SKUs proceed in parallel.
 
-Sorting matters: it gives every transaction the same lock-acquisition order and prevents deadlocks (`TX-A` locks A then B; `TX-B` locks B then A → deadlock). With sorting, `TX-B` waits for `TX-A` to release A before continuing.
+**State transitions — same pattern.** `findByIdForUpdate` locks the reservation row before any state machine call, so confirm and cancel are atomic.
 
-I chose **pessimistic** over **optimistic** for the stock path because contention is the point — when the system is under stress, lots of requests try to grab the same SKU at once. With optimistic locking, a stampede on `A100` would mean almost every retry sees a stale `version`, retries, sees it again, retries again — wasted work proportional to contention. Pessimistic locking serializes contended rows and lets uncontended SKUs proceed in parallel.
+**Expiry job vs. API** — the expiry query uses `FOR UPDATE SKIP LOCKED`. If an API transaction is mid-flight on a row, the job skips it; the next cron tick picks it up if it is still expired and unlocked. No coordination protocol needed.
 
-The `inventory.version` column is still useful: paths that don't take a pessimistic lock (event subscribers, future read-through cache writers) get optimistic-lock failure detection for free.
-
-**State transitions** (confirm/cancel) use the same `SELECT ... FOR UPDATE` pattern on the `reservations` row, so the state mutation and the event write happen in one atomic transaction. The State pattern (rather than service-layer if/else) makes it impossible to forget a transition check.
-
-**Expiry job vs. API** — the expiry job uses [`findExpired`](src/main/java/com/company/inventory/repository/ReservationRepository.java) with `FOR UPDATE SKIP LOCKED`. If a row is currently locked by an API confirm/cancel transaction, the job skips it; on the next tick, if it's still PENDING and still expired, it will be picked up. This satisfies the "expiry job must not race with API" requirement automatically.
+---
 
 ## 8. Idempotency implementation
 
-Three layers, in order of how they engage:
+Three layers engage in order:
 
-1. **Fast path** — `findByOrderId` lookup on the way in. If the row already exists, we return it as a duplicate immediately, no locks taken.
-2. **Atomic guard** — the `reservations.order_id UNIQUE` constraint. If two simultaneous requests both pass the fast-path check, exactly one INSERT will succeed; the other raises `DataIntegrityViolationException`.
-3. **Recovery** — the loser is caught in the controller (`IdempotentRetryException`), opens a fresh `REQUIRES_NEW` transaction via `fetchExistingByOrderId`, and returns the now-committed row to the client.
+1. **Fast path** — `findByOrderId` lookup on the way in. If the row already exists, return it as a duplicate immediately; no locks taken.
+2. **Atomic guard** — the `reservations.order_id UNIQUE` constraint. If two simultaneous requests both pass the fast-path check, exactly one INSERT succeeds; the other raises `DataIntegrityViolationException`.
+3. **Recovery** — the loser is caught in the controller, opens a fresh `REQUIRES_NEW` read transaction via `fetchExistingByOrderId`, and returns the committed row. Its own stock deductions and outbox event were rolled back, so stock cannot be double-decremented.
 
-The loser's failed transaction rolls back **both** its own stock deductions and its own outbox event. So at most one stock-deduction event was ever recorded, and stock cannot be double-decremented.
+Wire contract: new reservation → `HTTP 201 Created`. Duplicate orderId → `HTTP 200 OK` with existing data plus `X-Idempotent-Replay: true` and `X-Error-Code: DUPLICATE_ORDER` headers.
 
-Wire contract:
+---
 
-- New reservation → `HTTP 201 Created`.
-- Duplicate orderId → `HTTP 200 OK` with the existing reservation in `data`. Headers `X-Idempotent-Replay: true` and `X-Error-Code: DUPLICATE_ORDER` flag the replay so observability tools can count duplicates without parsing bodies.
+## 9. Event design — Advanced Track A (NATS JetStream)
 
-## 9. Event design
+Domain events are a sealed hierarchy under `DomainEvent`. The reservation service publishes them through `EventPublisher`; subscribers are auto-discovered via `List<EventSubscriber>`.
 
-Domain events are a hierarchy under `DomainEvent` (`ReservationCreatedEvent`, `ReservationConfirmedEvent`, `ReservationCancelledEvent`). The reservation service publishes them through `EventPublisher`; subscribers are auto-discovered.
+**In-process subscribers:**
+- `OutboxPersistenceSubscriber` — writes to `reservation_events` in the same transaction as the state change. Events are durable before any external delivery is attempted.
+- `SubscriberLogging` — emits a structured JSON log line per event.
 
-Two subscribers ship in the box:
+**NATS outbox relay (`NatsOutboxJob`):**
+- Runs on a cron schedule (`nats.job-cron`, default every minute).
+- Reads unpublished rows from `reservation_events WHERE published_at IS NULL ORDER BY id ASC` in configurable batches.
+- Builds a `NatsEventEnvelope` (eventType, reservationId, orderId, timestamp, payload) and publishes to one of three subjects: `reservations.created`, `reservations.confirmed`, `reservations.cancelled`.
+- Sets `Nats-Msg-Id` header to `{reservationId}.{eventType}.{rowId}` for server-side deduplication within the NATS dedup window.
+- Marks `published_at` only after receiving a `PublishAck` from NATS, ensuring at-least-once delivery.
 
-- **`OutboxPersistenceSubscriber`** — writes a row into `reservation_events` in the same transaction as the state change. This is the **outbox pattern**: events are durable even if the process dies before any other subscriber processes them.
-- **`SubscriberLogging`** — emits a structured JSON log line per event for observability.
+**NATS stream configuration (`NatsConfig`):**
+- Stream name: `RESERVATIONS`, subjects: `reservations.*`, storage: file, retention: limits.
+- Error code 10058 (stream already exists) is tolerated on startup so restarts are safe.
 
-Adding a NATS publisher (Advanced track A) would be one new class implementing `EventSubscriber`. The reservation service does not change. A drainer would scan `reservation_events WHERE published_at IS NULL ORDER BY id ASC`, publish to NATS with `MsgID = id` for at-least-once de-duplication on the consumer side, then UPDATE `published_at`.
+**NATS consumer (`NatsInventoryEventConsumer`):**
+- Durable push consumer: `warehouse-audit-consumer`, `AckPolicy.Explicit`, `DeliverPolicy.All`, 30 s ack-wait, max 5 redeliveries.
+- Bounded LRU map (capacity 1000) deduplicates by stream sequence number in-process.
+- On successful processing: `msg.ack()`. On parse failure: `msg.nak()` so NATS redelivers up to the max-deliver limit.
 
-## 10. Redis design
+**When NATS is unavailable:** all NATS beans are gated by `@ConditionalOnProperty(name="nats.enabled", havingValue="true")`. With `nats.enabled=false` the application runs without touching NATS — no bean created, no connection attempted. Outbox rows accumulate until NATS is restored.
 
-Not implemented — Advanced track B was not selected. Notes for what I'd do:
+---
 
-- **Keys** — `inventory:{sku}` storing the `InventoryResponse` JSON. TTL 30 s as the spec suggests.
-- **Cache stampede** — single-flight via Redis SETNX or Caffeine local mutex inside a Redis fallback layer.
-- **Invalidation** — synchronous `DEL` on every commit that mutated stock, with a `TransactionSynchronizationManager.afterCommit` hook so we never invalidate before the row is durable.
-- **Distributed lock** — Redisson `RLock("lock:expiry-job")` with leaseTime ≪ jobInterval (e.g. 60 s lease for a 120 s interval) and `tryLock(0, leaseTime)` so competing workers skip rather than block.
-- **Fallback** — a `try/catch (RedisConnectionException)` → log warn → fall back to Postgres read-through. Health check would still report `UP` because Redis is a cache, not a dependency.
+## 10. Redis design — Advanced Track B
 
-## 11. Expiry job design (multi-instance safety)
+**Cache key strategy** — `inventory::{sku}` (e.g. `inventory::A100`). Implemented in `InventoryCacheService.KEY_PREFIX`.
 
-`ReservationExpiryJob` runs every 2 minutes via `@Scheduled(cron = ...)`. Inside, it calls `ReservationService.findAndExpireReservation(batchSize)`, whose query is:
+**TTL** — 30 seconds, configured via `redis.cache-ttl-seconds`. Short enough that stale stock data expires quickly; long enough to absorb a read spike on a popular SKU.
 
-```sql
-select * from reservations
- where status = 'PENDING' and expires_at < :now
- order by expires_at asc
- limit :limit
- for update skip locked
-```
+**Cache population** — lazy read-through in `InventoryService.getInventoryBySku()`. On a cache miss: read from Postgres, serialize the `InventoryResponse` record to JSON, write to Redis with TTL, return. No startup pre-warming.
 
-The `SKIP LOCKED` is the multi-instance guarantee. If two app pods run the job simultaneously, each grabs an unlocked batch; concurrent runs see disjoint sets of rows. No row is processed twice in the same window.
+**Cache invalidation** — synchronous `DEL` call inside the write transaction in `ReservationService`, immediately after `reserve()` or `release()` modifies a SKU's available stock. This is optimistic invalidation — the write has not yet committed when the delete runs, but since we're deleting (not updating), the worst outcome is an unnecessary cache miss, not stale data.
 
-I deliberately **avoided** a global cluster-lock (Redis, ZooKeeper, lease tables). Reasons:
+**Fallback behaviour** — `InventoryCacheService` holds a `@Nullable StringRedisTemplate`. If Redis is disabled (`redis.enabled=false`) the template is null and all operations are no-ops. If Redis goes down at runtime, every Redis call is wrapped in a try/catch that logs a warning and returns `Optional.empty()`, falling through to Postgres. Redis unavailability never propagates an exception to the caller.
 
-- `SKIP LOCKED` is sufficient for correctness with no extra moving parts.
-- It scales horizontally — multiple instances share the work instead of one being idle.
-- It requires zero infra beyond Postgres, which we already have.
+**Distributed lock for expiry job** — `DistributedLockService` interface with two implementations:
+- `RedisDistributedLockService` — `SET NX PX` via `setIfAbsent(key, "1", ttl)` with zero-second wait. Returns `false` if the key is already held, so competing instances skip rather than block.
+- `NoOpDistributedLockService` — always returns `true`; used when Redis is disabled, so the job still runs (single-instance fallback).
 
-If we later need the job to run on exactly one instance for rate-limiting or audit reasons, swap to Postgres `pg_try_advisory_lock(JOB_ID)` or a Redis lock — same idea, different fence.
+Lock key: `lock:expiry-job` (configurable via `redis.expiry-job-lock-key`). Lock TTL: 90 seconds (`redis.expiry-job-lock-ttl-seconds`), shorter than the 2-minute job interval. The lock is always released in a `finally` block.
 
-The same row-level locks taken by API confirm/cancel mean the expiry job cannot race with a concurrent user action on the same reservation.
+---
+
+## 11. Expiry job design
+
+`ReservationExpiryJob` runs every 2 minutes (`app.reservation.expiry-job-cron`). On each tick:
+
+1. Attempts to acquire the distributed lock (`lock:expiry-job`, 90 s TTL). Skips the run if the lock is already held by another instance.
+2. Calls `findAndExpireReservation(batchSize)` in a loop until the batch is smaller than `batchSize`, draining the full backlog.
+3. Releases the lock in a `finally` block.
+
+The underlying query uses `FOR UPDATE SKIP LOCKED`, so even without the Redis lock, concurrent instances grab disjoint sets of rows and never double-process a reservation. The Redis lock adds a coarser guarantee: only one instance runs the full loop at a time, useful for rate-limiting the load on Postgres.
+
+When Redis is unavailable `NoOpDistributedLockService` is injected and the lock step is transparent — all instances run, `SKIP LOCKED` keeps correctness.
+
+---
 
 ## 12. Security approach
 
-A single servlet filter, [`ApiKeyAuthFilter`](src/main/java/com/company/inventory/security/ApiKeyAuthFilter.java):
+A single servlet filter, `ApiKeyAuthFilter`, reads the `X-API-Key` header and compares it against a `Set<String>` built from `app.security.api-keys` (comma-separated, overridable via `APP_SECURITY_API_KEYS` env var). Missing or invalid keys return `401 UNAUTHORIZED` in the standard `ApiError` envelope. Allow-listed paths (no key required): `/health`, `/v3/api-docs/**`, `/swagger-ui/**`.
 
-- Reads the `X-API-Key` header.
-- Compares against a `Set<String>` built from `app.security.api-keys` (comma-separated property, also overridable via `APP_SECURITY_API_KEYS` env var).
-- Returns `401 UNAUTHORIZED` in the standard ApiError envelope on missing/invalid keys.
-- Allow-listed endpoints (no API key required): `/health`, `/v3/api-docs/**`, `/swagger-ui/**`, `/swagger-ui.html`.
+The filter is registered via `FilterRegistrationBean` (not as a Spring bean) to avoid double-registration. `spring-boot-starter-security` was intentionally excluded — the spec asks for an API key check, not an identity model, and a 70-line filter is easier to audit than the security DSL for this use case.
 
-The filter is registered via `FilterRegistrationBean` (not as a bean) to avoid double-registration via Spring Boot's automatic filter discovery. Order = 1 ensures it runs before any other servlet filter.
-
-I deliberately did **not** pull in `spring-boot-starter-security` — the spec asked for an API key check, not an identity model. A 70-line filter is easier to audit than the security DSL for this use case.
+---
 
 ## 13. How to run the system
 
 ```bash
-# Start Postgres (and pgAdmin on port 8082)
-docker compose up
+# Start Postgres, NATS, and Redis
+docker build -t inventory-app:1.0 .
+docker compose up -d
 
-# In a separate terminal, run the application
+# Run the application (NATS and Redis enabled by default)
 ./mvnw spring-boot:run
+
+# Or run with Redis and NATS disabled (Core only)
+NATS_ENABLED=false REDIS_ENABLED=false ./mvnw spring-boot:run
 ```
 
-The `docker-compose.yml` starts Postgres and pgAdmin. The application service is provided commented-out as a reference — run the app directly with Maven (or build the Docker image first with `./mvnw package` and `docker build -t inventory-app:0.1 .`). Liquibase migrations apply automatically on boot.
+| URL | Description |
+|---|---|
+| http://localhost:8080/swagger-ui.html | Swagger UI |
+| http://localhost:8080/v3/api-docs | OpenAPI spec |
+| http://localhost:8080/health | Health check |
+| http://localhost:8082 | pgAdmin (admin@example.com / adminpassword) |
+| localhost:4222 | NATS (JetStream enabled) |
+| localhost:6379 | Redis |
 
-- **Swagger UI**: <http://localhost:8080/swagger-ui.html>
-- **OpenAPI spec**: <http://localhost:8080/v3/api-docs>
-- **Health**: <http://localhost:8080/health>
-- **pgAdmin**: <http://localhost:8082> (email: `admin@example.com`, password: `adminpassword`)
-- **Default API key** (override via `APP_SECURITY_API_KEYS`): `dev-api-key-001`
-
-Quick smoke test:
+Default API key: `dev-api-key-001` (override via `APP_SECURITY_API_KEYS`).
 
 ```bash
-# Reserve some stock
+# Reserve stock
 curl -s -X POST http://localhost:8080/api/v1/reservations \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-api-key-001' \
   -d '{"orderId":"ORD-1001","items":[{"sku":"A100","quantity":5}]}'
 
-# Look up the reservation
-curl -s http://localhost:8080/api/v1/reservations/<id> \
-  -H 'X-API-Key: dev-api-key-001'
-
-# Check stock
+# Check inventory (served from Redis cache after first hit)
 curl -s http://localhost:8080/api/v1/inventory/A100 \
   -H 'X-API-Key: dev-api-key-001'
 ```
 
+---
+
 ## 14. How to run the tests
 
 ```bash
-# Unit tests only (fast, no Docker required)
+# Unit tests only — no Docker required, fast
 ./mvnw test
 
-# Unit + integration tests (Testcontainers spins up Postgres in Docker)
+# Unit + integration tests — Testcontainers spins up Postgres (Docker must be running)
 ./mvnw verify
 ```
 
-Integration tests use Testcontainers with `withReuse(true)`, so a Postgres container is shared across runs once you've enabled reuse in `~/.testcontainers.properties` (`testcontainers.reuse.enable=true`). Otherwise a fresh container is started per test class — slower but self-contained.
+Unit tests mock all infrastructure (Postgres, Redis, NATS). Integration tests use a shared static `PostgreSQLContainer`; NATS and Redis are disabled via `@DynamicPropertySource` in `AbstractIntegrationTest`. Coverage gate: **85% instruction coverage** enforced by the JaCoCo `check` goal during `verify`.
 
-## 15. Trade-offs I made
+---
 
-- **No Advanced tracks A or B.** I prioritised depth on the Core requirements over wiring NATS and Redis. The event boundary is designed so adding a NATS subscriber is one class.
-- **In-process event dispatch.** Today, subscribers run synchronously inside the same transaction as the state change. That's a feature for the outbox subscriber (atomicity) and a small risk for the structured-log subscriber (a logger that hangs would slow the request). I judged the risk acceptable given how the logging library is used.
-- **No outbox drainer included.** The outbox table is written transactionally; a separate process to drain `published_at IS NULL` rows to a real broker would be needed once Advanced track A is on. Implementation sketch is in §9.
-- **API key set held in memory.** Adequate for the stated requirement ("valid keys can be configured via application properties or environment variables"). For real production I'd back this with a secret store and a hot-reload mechanism.
-- **No rate limiting.** The spec didn't require it. With 10k rps as the target (see §16), it would be the next thing I added.
-- **Pessimistic over optimistic locking** on the stock path. Trade-off discussed in §7 — pessimistic wins on contended SKUs at the cost of slightly more lock acquisition cost on uncontended paths.
-- **Tests are good but not exhaustive.** I covered every business rule the spec called out, plus the four required concurrency / idempotency / pagination / security / OpenAPI / migration ITs. Edge cases I'd add given more time: very large `items[]` requests, expiry job racing the cancel API on the same row (`pg_advisory_xact_lock` would make this assertable in the test rather than only in the production code).
+## 15. Trade-offs made
 
-## 16. What would break at 10,000 reservation requests / minute
+- **Optimistic-inside-pessimistic invalidation.** Cache eviction runs inside the write transaction, before commit. The window where a reader could cache pre-commit data is tiny (milliseconds), and since we DELETE rather than update, the worst outcome is an extra Postgres read, not stale data being served. A stricter approach would use `TransactionSynchronizationManager.afterCommit`, at the cost of more complexity.
+- **In-process event dispatch.** Subscribers run synchronously inside the reservation transaction. This is a feature for `OutboxPersistenceSubscriber` (atomicity) and a small risk for logging-only subscribers (a slow logger could slow the request). Accepted for the scope of this exercise.
+- **Outbox relay as a scheduled poll.** `NatsOutboxJob` polls on a cron schedule rather than reacting to a DB `LISTEN/NOTIFY`. This introduces up to 1 minute of delivery latency and adds a Postgres read every minute even when idle. `LISTEN/NOTIFY` would be the right follow-up.
+- **No rate limiting.** Not in the spec. Would be the next addition before production.
+- **API keys held in memory.** Adequate for the exercise; a real deployment would back this with a secret store and support hot-reload.
+- **UUID v4 for reservation IDs.** Correct, but slightly worse insert locality than UUID v7. Would switch once JDK support stabilises.
 
-10k/min is ~167 rps sustained. The first thing to fail will depend on the **distribution across SKUs**:
+---
 
-- **Heavy skew on a single hot SKU** — pessimistic row-level locking on `inventory.sku` becomes the bottleneck. At ~167 rps for the same row, with each transaction holding the lock for the duration of the whole reservation (DB roundtrip + event write + outbox insert ≈ 5–15 ms), we'd serialize at roughly 65–200 successful reservations per second per hot SKU. Beyond that, transactions queue up; latency p99 climbs from a few ms into hundreds of ms; HikariCP pool exhausts; the API starts returning 500s as connection acquisition times out.
+## 16. What would break at 10,000 reservation requests per minute
 
-  **Fix**: shard the hot SKU into N "buckets" — `inventory_buckets(sku, bucket_id, stock)` — and pick a bucket per request (round-robin or hash of orderId). The state-of-the-art version of this is Pinot's "ledger-based inventory" or Stripe's "stock partitions" pattern. Behind the scenes you reconcile across buckets at low traffic.
+10k/min ≈ 167 rps sustained. The first failure depends on SKU distribution.
 
-- **Even spread across many SKUs** — Postgres handles 10k rps comfortably on a modest box, but the **outbox writes** become a write-amplification problem. Every reservation = 1 reservation row + 1 event row + N item rows + 1+N inventory updates. At 167 rps that's ~1k row writes/second, fine on commodity hardware but you'll start seeing checkpoint pressure. The connection pool (`maximum-pool-size: 20`) becomes the hard ceiling at roughly 20 × (1 / mean-tx-time) rps.
+**Hot single SKU (worst case).** Pessimistic row-level locking on `inventory` serializes every request touching the same SKU. At 167 rps with a 5–15 ms transaction (DB roundtrip + event write + outbox insert), a single row can service roughly 65–200 transactions per second. Beyond that, transactions queue behind the lock; p99 latency climbs from milliseconds into hundreds of milliseconds; the HikariCP pool (capped at 20) exhausts; the API returns 500s as connection acquisition times out.
 
-  **Fix**: tune Hikari pool to match (CPU cores × 2 + spindle count) per the Hikari guide, ~50 in a typical production setup; raise Postgres `max_wal_size` and `checkpoint_timeout`; introduce a write-side cache (Redis) so the read path doesn't compete with the write path for connections.
+Fix: partition the hot SKU into N stock buckets (`inventory_buckets(sku, bucket_id, stock)`). Pick a bucket per request by hashing `orderId`. Reconcile across buckets asynchronously.
 
-- **Expiry job** — if the PENDING backlog grows large (hot SKU running out of stock means lots of cancelled-due-to-bad-luck reservations don't enter the system, but anything that succeeds and times out does), the per-tick batch (`expiry-batch-size: 100`) may not keep up. The job will start running long, eventually overlapping with the next tick.
+**Even SKU spread.** Postgres handles 167 rps comfortably on commodity hardware, but write amplification accumulates: each reservation writes 1 reservation row + N item rows + N inventory updates + 1 outbox event. The HikariCP pool at 20 connections becomes the ceiling at roughly `20 / mean_tx_time_seconds` rps.
 
-  **Fix**: make the batch size and frequency tunable; have the job loop until the batch is short (already implemented); add metrics so we alert on backlog age.
+Fix: tune the Hikari pool to `(vCPUs × 2 + disk spindles)` ≈ 50 for a typical production node; ensure the Redis cache absorbs all inventory read traffic so reads and writes don't compete for connections.
 
-The single most likely first failure under realistic load is **HikariCP connection acquisition timeouts** when one or two SKUs are hot. The fix order I'd execute:
+**Expiry job.** If the PENDING backlog grows faster than the job drains it (100 rows / 2 min = ~0.8 rows/s), the job runs long and overlaps with the next tick. The distributed lock prevents concurrent runs; the `SKIP LOCKED` query prevents double-processing; but backlog growth still degrades reservation latency.
 
-1. Add a `Micrometer` metric on `inventory.reserve_lock_wait_ms` per SKU and alert at p95 > 100 ms.
-2. Bump the Hikari pool to ~50 once the metric tells us where the contention actually lives.
-3. Shard the hot SKUs into buckets.
-4. Add a Redis read-through cache for `GET /inventory/{sku}` so reads don't compete for connections (Advanced track B as designed).
-5. Move the outbox publisher into a separate process so the API's write-tx is shorter.
+Fix: make batch size and cron interval tunable; alert on backlog age via a Micrometer gauge on `reservation_events WHERE published_at IS NULL`.
+
+**Most likely first failure:** HikariCP exhaustion on a hot SKU. Fix order: (1) add `reserve_lock_wait_ms` per-SKU metrics and alert at p95 > 100 ms; (2) expand the pool to 50; (3) shard hot SKUs; (4) Redis read-through cache is already in place, ensuring read traffic never competes with writes for connections.
 
 ---
 
 ## Appendix: Files of interest
 
-- **State pattern**: `src/main/java/com/company/inventory/domain/state/`
-- **Factory pattern**: `src/main/java/com/company/inventory/domain/factory/ReservationFactory.java`
-- **Observer pattern**: `src/main/java/com/company/inventory/messaging/`
-- **Concurrency**: `ReservationService.createReservation` and `findAndExpireReservation`, plus `InventoryRepository.findBySkuInOrderBySkuAsc` and `ReservationRepository.findExpired`.
-- **Idempotency**: `ReservationService.createReservation` (the two-phase guard) + `ReservationController.create` (the recovery branch) + `003-create-reservations.sql` (the unique constraint).
-- **Audit trail**: `log/StateTransitionLogger.java` + `logback-spring.xml`.
-- **Liquibase changesets**: `src/main/resources/db/changelog/changes/`.
-- **Concurrent integration tests**: `src/test/java/com/company/inventory/integration/ReservationConcurrencyIT.java`.
+| Concern | Location |
+|---|---|
+| State pattern | `domain/state/` |
+| Factory pattern | `domain/factory/ReservationFactory.java` |
+| Observer / fan-out | `messaging/publisher/` and `messaging/subscribers/` |
+| Pessimistic locking | `repository/InventoryRepository.java`, `ReservationRepository.java` |
+| Idempotency | `service/ReservationService.createReservation`, `controller/ReservationController.create`, `003-create-reservations.sql` |
+| NATS outbox relay | `messaging/nats/NatsOutboxJob.java` |
+| NATS consumer | `messaging/nats/NatsInventoryEventConsumer.java` |
+| Redis cache | `cache/InventoryCacheService.java` |
+| Distributed lock | `cache/DistributedLockService.java`, `cache/RedisDistributedLockService.java` |
+| Structured audit trail | `log/StateTransitionLogger.java`, `resources/logback-spring.xml` |
+| Liquibase changesets | `resources/db/changelog/changes/` |
+| Concurrency integration tests | `integration/ReservationConcurrencyIT.java` |

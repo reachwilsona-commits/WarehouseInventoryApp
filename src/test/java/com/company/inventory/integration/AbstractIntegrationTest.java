@@ -28,7 +28,8 @@ public abstract class AbstractIntegrationTest {
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("app.security.api-keys", () -> "test-key-1,test-key-2");
         registry.add("app.reservation.expiry-job-cron", () -> "-");
-        registry.add("nats.enabled", () -> "false");
+        registry.add("nats.enabled",  () -> "false");
+        registry.add("redis.enabled", () -> "false");
     }
     protected String url(String path) {
         return "http://localhost:" + port + path;

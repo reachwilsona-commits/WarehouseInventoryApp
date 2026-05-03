@@ -29,7 +29,6 @@ public class InventoryController {
      */
     @GetMapping("/{sku}")
     public ResponseEntity<ApiResponse<InventoryResponse>> getSkuDetails(@PathVariable String sku) {
-        return ResponseEntity.ok(
-                ApiResponse.success(InventoryResponse.fromInventory(inventoryService.getBySku(sku))));
+        return ResponseEntity.ok(ApiResponse.success(inventoryService.getInventoryBySku(sku)));
     }
 }

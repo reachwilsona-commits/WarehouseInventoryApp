@@ -1,5 +1,6 @@
 package com.company.inventory.service;
 
+import com.company.inventory.cache.InventoryCacheService;
 import com.company.inventory.domain.event.*;
 import com.company.inventory.exception.IdempotentRetryException;
 import com.company.inventory.model.request.RequestedItem;
@@ -35,7 +36,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * Service class for Reservation
+ * Service class for Create, Confirm, Cancel Reservation
  */
 @Service
 public class ReservationService {
@@ -45,31 +46,32 @@ public class ReservationService {
     private final ReservationFactory reservationFactory;
     private final EventPublisher eventPublisher;
     private final StateTransitionLogger transitionLogger;
+    private final InventoryCacheService cacheService;
 
     public ReservationService(ReservationRepository reservationRepository,
                               InventoryRepository inventoryRepository,
                               ReservationFactory reservationFactory,
                               EventPublisher eventPublisher,
-                              StateTransitionLogger transitionLogger) {
+                              StateTransitionLogger transitionLogger,
+                              InventoryCacheService cacheService) {
         this.reservationRepository = reservationRepository;
         this.inventoryRepository = inventoryRepository;
         this.reservationFactory = reservationFactory;
         this.eventPublisher = eventPublisher;
         this.transitionLogger = transitionLogger;
+        this.cacheService = cacheService;
     }
 
     /**
-     * Method to create a new reservation, atomically deducting stock and persisting an event.
+     * Create a new reservation, atomically deducting stock and persisting an event.
      */
     @Transactional
     public ReservationResult createReservation(ReservationCommand command) {
-        // 1. Check for existence of orderId
         var order = reservationRepository.findByOrderId(command.orderId());
         if (order.isPresent()) {
             return ReservationResult.duplicate(order.get());
         }
 
-        // 2. Lock the inventory rows for reservation as sorted List
         var sortedSkus = command.items().stream()
                 .map(ReservationCommand.Item::sku)
                 .distinct()
@@ -83,11 +85,8 @@ public class ReservationService {
         sortedSkus.stream()
                 .filter(sku -> !bySku.containsKey(sku))
                 .findFirst()
-                .ifPresent(sku -> {
-                    throw new SkuNotFoundException(sku);
-                });
+                .ifPresent(sku -> { throw new SkuNotFoundException(sku); });
 
-        //3. Deduplicate the requested SKU
         Map<String, Integer> requestedItem =
                 command.items().stream()
                         .collect(Collectors.toMap(
@@ -96,20 +95,14 @@ public class ReservationService {
                                 Integer::sum
                         ));
 
-        //4. Make sure requested SKU's are available
         requestedItem.entrySet().stream()
                 .filter(e -> bySku.get(e.getKey()).getAvailableStock() < e.getValue())
                 .findFirst()
                 .ifPresent(e -> {
                     Inventory inv = bySku.get(e.getKey());
-                    throw new InsufficientStockException(
-                            e.getKey(),
-                            inv.getAvailableStock(),
-                            e.getValue()
-                    );
+                    throw new InsufficientStockException(e.getKey(), inv.getAvailableStock(), e.getValue());
                 });
 
-        //5. Apply deductions from Inventory
         requestedItem.entrySet().stream()
                 .filter(e -> {
                     Inventory inv = bySku.get(e.getKey());
@@ -118,25 +111,18 @@ public class ReservationService {
                 .findFirst()
                 .ifPresent(e -> {
                     Inventory inv = bySku.get(e.getKey());
-                    throw new InsufficientStockException(
-                            e.getKey(),
-                            inv.getAvailableStock(),
-                            e.getValue()
-                    );
+                    throw new InsufficientStockException(e.getKey(), inv.getAvailableStock(), e.getValue());
                 });
-        //6. Save the reservation
+
+        // Invalidate cache for every SKU whose available stock changed
+        requestedItem.keySet().forEach(cacheService::evict);
+
         var reservation = saveReservation(command);
-        // 7. publish the reservation as Event
         publishEvent(EventType.RESERVATION_CREATED, reservation, null);
-        //8. log the transition
-        logTransition(reservation, null, ReservationStatus.PENDING);
-        //9. Return the reservation response
+        logTransition(reservation, null, ReservationStatus.PENDING, Trigger.API);
         return ReservationResult.created(reservation);
     }
-    /**
-     * Method to save the reservation
-     * @param command ReservationCommand
-     */
+
     private Reservation saveReservation(ReservationCommand command) {
         var reservation = reservationFactory.create(
                 command.orderId(),
@@ -151,11 +137,6 @@ public class ReservationService {
         return reservation;
     }
 
-    /**
-     * Method to find Existing  Order By OrderId
-     * @param orderId String
-     * @return Reservation
-     */
     @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
     public Reservation fetchExistingByOrderId(String orderId) {
         return reservationRepository.findByOrderId(orderId)
@@ -163,64 +144,39 @@ public class ReservationService {
                         "Idempotent retry path: expected reservation for orderId " + orderId + " not found"));
     }
 
-    /**
-     * Method to confirm the reservation
-     * @param id UUID
-     * @return Reservation
-     */
     @Transactional
     public Reservation confirmReservation(UUID id) {
-        // 1. Find the reservation
         var reservation = reservationRepository.findByIdForUpdate(id)
                 .orElseThrow(() -> new ReservationNotFoundException(id));
-        // 2. Confirm the reservation
         reservation.confirm();
-        //3. Publish the event
         publishEvent(EventType.RESERVATION_CONFIRMED, reservation, null);
-        //4. Log the event
-        logTransition(reservation, ReservationStatus.PENDING, reservation.getStatus());
+        logTransition(reservation, ReservationStatus.PENDING, reservation.getStatus(), Trigger.API);
         return reservation;
     }
 
-    /**
-     * Method to Cancel the Reservation from the API call
-     * @param id UUID
-     * @return Reservation
-     */
     @Transactional
     public Reservation cancelReservation(UUID id) {
-        //1. Find the reservation by Id
         var reservation = reservationRepository.findByIdForUpdate(id)
                 .orElseThrow(() -> new ReservationNotFoundException(id));
-        reservation = cancelInternal(reservation, CancellationReason.USER_REQUEST, StateTransitionLogger.Trigger.API);
-        return reservation;
+        return cancelInternal(reservation, CancellationReason.USER_REQUEST, Trigger.API);
     }
 
-    /**
-     * Common method to cancel the reservation from both API and Scheduler Job
-     * @param reservation Reservation
-     * @param reason CancellationReason
-     * @param trigger Trigger
-     * @return Reservation
-     */
     @Transactional
-    public Reservation cancelInternal(Reservation reservation, CancellationReason reason, Trigger trigger ) {
-        //1. Cancel the reservation, throws exception if not PENDING.
+    public Reservation cancelInternal(Reservation reservation, CancellationReason reason, Trigger trigger) {
+        // Capture the pre-cancel status so logTransition records the correct fromState
+        ReservationStatus fromStatus = reservation.getStatus();
         reservation.cancel();
-        // 2. Sort SKU's from the Reservation
+
         List<String> skus = reservation.getItems().stream()
                 .map(ReservationItem::getSku)
                 .sorted()
                 .toList();
-        // 3. Find the Inventory items from SKU's
+
         var lockedInventory = inventoryRepository.findBySkuInOrderBySkuAsc(skus);
         Map<String, Inventory> skuMap =
                 lockedInventory.stream()
-                        .collect(Collectors.toMap(
-                                Inventory::getSku,
-                                Function.identity()
-                        ));
-        //4. Group items by SKU in case the same SKU appears multiple times.
+                        .collect(Collectors.toMap(Inventory::getSku, Function.identity()));
+
         Map<String, Integer> qtySkuMap =
                 reservation.getItems().stream()
                         .collect(Collectors.toMap(
@@ -232,41 +188,27 @@ public class ReservationService {
         qtySkuMap.entrySet().stream()
                 .filter(e -> skuMap.get(e.getKey()) == null)
                 .findFirst()
-                .ifPresent(e -> {
-                    throw new SkuNotFoundException(e.getKey());
-                });
+                .ifPresent(e -> { throw new SkuNotFoundException(e.getKey()); });
 
-        qtySkuMap.forEach((sku, qty) ->
-                skuMap.get(sku).release(qty)
-        );
-        //5. Publish Event
+        qtySkuMap.forEach((sku, qty) -> skuMap.get(sku).release(qty));
+
+        // Invalidate cache for every SKU whose available stock changed
+        qtySkuMap.keySet().forEach(cacheService::evict);
+
         publishEvent(EventType.RESERVATION_CANCELLED, reservation, reason);
-        //6. Log the Event
-        logTransition(reservation, reservation.getStatus(), reservation.getStatus());
+        logTransition(reservation, fromStatus, reservation.getStatus(), trigger);
         return reservation;
     }
 
-    /**
-     * Fetch Reservation by UUID
-     * @param id UUID
-     * @return Reservation
-     */
     @Transactional(readOnly = true)
     public Reservation get(UUID id) {
         return reservationRepository.findById(id)
                 .orElseThrow(() -> new ReservationNotFoundException(id));
     }
 
-    /**
-     * Get Pageable ReservationResponse
-     * @param page int
-     * @param size int
-     * @param status ReservationStatus
-     * @return Page<ReservationResponse>
-     */
     @Transactional(readOnly = true)
     public Page<ReservationResponse> list(int page, int size, ReservationStatus status) {
-        if (page < 0)            throw new IllegalArgumentException("page must be >= 0");
+        if (page < 0)                throw new IllegalArgumentException("page must be >= 0");
         if (size <= 0 || size > 200) throw new IllegalArgumentException("size must be 1..200");
 
         Pageable pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
@@ -281,11 +223,6 @@ public class ReservationService {
         });
     }
 
-    /**
-     * This method is triggered by Scheduled Job
-     * @param limit int
-     * @return List<Reservation>
-     */
     @Transactional
     public List<Reservation> findAndExpireReservation(int limit) {
         List<Reservation> expiredReservation = reservationRepository.findExpired(OffsetDateTime.now(), limit);
@@ -296,14 +233,7 @@ public class ReservationService {
         return expiredReservation;
     }
 
-    /**
-     * Common method to handle all type of Events
-     * @param eventType EventType
-     * @param reservation Reservation
-     */
-    private void publishEvent(EventType eventType,
-                              Reservation reservation,
-                              CancellationReason cancellationReason) {
+    private void publishEvent(EventType eventType, Reservation reservation, CancellationReason cancellationReason) {
         DomainEvent event = switch (eventType) {
             case RESERVATION_CREATED -> new ReservationCreatedEvent(
                     reservation.getId(),
@@ -313,30 +243,18 @@ public class ReservationService {
                     reservation.getItems().stream()
                             .map(i -> new ReservationCreatedEvent.Item(i.getSku(), i.getQuantity()))
                             .toList());
-
             case RESERVATION_CONFIRMED -> new ReservationConfirmedEvent(
-                    reservation.getId(),
-                    reservation.getOrderId(),
-                    OffsetDateTime.now());
-
+                    reservation.getId(), reservation.getOrderId(), OffsetDateTime.now());
             case RESERVATION_CANCELLED -> new ReservationCancelledEvent(
-                    reservation.getId(),
-                    reservation.getOrderId(),
-                    OffsetDateTime.now(),
-                    cancellationReason);
+                    reservation.getId(), reservation.getOrderId(), OffsetDateTime.now(), cancellationReason);
         };
         eventPublisher.publish(event);
     }
 
-    /**
-     * Method to LOG the transition
-     * @param reservation Reservation
-     * @param from        ReservationStatus
-     * @param to          ReservationStatus
-     */
-    private void logTransition(Reservation reservation, ReservationStatus from, ReservationStatus to) {
+    private void logTransition(Reservation reservation,
+                                ReservationStatus from, ReservationStatus to,
+                                Trigger trigger) {
         transitionLogger.logTransition(
-                reservation.getId(), reservation.getOrderId(),
-                from, to, Trigger.API);
+                reservation.getId(), reservation.getOrderId(), from, to, trigger);
     }
 }

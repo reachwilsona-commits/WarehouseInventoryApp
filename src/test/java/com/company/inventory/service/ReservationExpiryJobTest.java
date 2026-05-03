@@ -1,5 +1,8 @@
 package com.company.inventory.service;
 
+import com.company.inventory.cache.InventoryCacheService;
+import com.company.inventory.cache.NoOpDistributedLockService;
+import com.company.inventory.config.RedisProperties;
 import com.company.inventory.log.StateTransitionLogger;
 import com.company.inventory.config.ReservationProperties;
 import com.company.inventory.domain.event.DomainEvent;
@@ -30,6 +33,11 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+/**
+ * Spec coverage for expiry-job integration with ReservationService:
+ *  - expired reservation is cancelled, stock returned, TTL_EXPIRED event emitted
+ *  - non-expired rows (not returned by query) are untouched
+ */
 class ReservationExpiryJobTest {
 
     private ReservationRepository reservationRepository;
@@ -37,18 +45,23 @@ class ReservationExpiryJobTest {
     private ReservationService service;
     private final List<DomainEvent> events = new ArrayList<>();
 
+    private static final RedisProperties REDIS_PROPS =
+            new RedisProperties("localhost", 6379, false, 30L, "lock:expiry-job", 90L);
+
     @BeforeEach
     void setUp() {
         reservationRepository = mock(ReservationRepository.class);
-        inventoryRepository = mock(InventoryRepository.class);
+        inventoryRepository   = mock(InventoryRepository.class);
         EventPublisher publisher = events::add;
         StateTransitionLogger logger = mock(StateTransitionLogger.class);
+        InventoryCacheService cacheService = mock(InventoryCacheService.class);
 
         ReservationProperties props = new ReservationProperties(10, "0 */2 * * * *", 100);
         Clock clock = Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC);
         ReservationFactory factory = new ReservationFactory(props, clock);
 
-        service = new ReservationService(reservationRepository, inventoryRepository, factory, publisher, logger);
+        service = new ReservationService(reservationRepository, inventoryRepository,
+                factory, publisher, logger, cacheService);
         events.clear();
     }
 
@@ -83,10 +96,11 @@ class ReservationExpiryJobTest {
 
     @Test
     void recentReservation_notReturnedByClaim_isNotTouched() {
-        // The skip-locked claim query returns nothing for non-expired rows.
         when(reservationRepository.findExpired(any(OffsetDateTime.class), anyInt()))
                 .thenReturn(new ArrayList<>());
+
         List<Reservation> processed = service.findAndExpireReservation(100);
+
         assertThat(processed).isEmpty();
         assertThat(events).isEmpty();
     }

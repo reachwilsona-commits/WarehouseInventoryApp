@@ -1,8 +1,6 @@
 package com.company.inventory.controller;
 
-import com.company.inventory.domain.event.CancellationReason;
 import com.company.inventory.exception.IdempotentRetryException;
-import com.company.inventory.log.StateTransitionLogger;
 import com.company.inventory.model.response.ApiResponse;
 import com.company.inventory.model.request.CreateReservationRequest;
 import com.company.inventory.model.response.PageResponse;

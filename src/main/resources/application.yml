@@ -56,6 +56,14 @@ app:
     expiry-job-cron: "0 */2 * * * *"
     expiry-batch-size: 100
 
+redis:
+  host: ${REDIS_HOST:localhost}
+  port: ${REDIS_PORT:6379}
+  enabled: ${REDIS_ENABLED:true}
+  cache-ttl-seconds: 30
+  expiry-job-lock-key: lock:expiry-job
+  expiry-job-lock-ttl-seconds: 90
+
 nats:
   url: ${NATS_URL:nats://localhost:4222}
   stream-name: RESERVATIONS
